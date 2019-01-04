@@ -38,6 +38,10 @@ evaluateAndCacheCall(SILFunction &fn, SubstitutionMap substitutionMap,
 // general framework.
 
 enum class WellKnownFunction {
+  // Array.init()
+  ArrayInitEmpty,
+  // Array._allocateUninitializedArray
+  AllocateUninitializedArray,
   // String.init()
   StringInitEmpty,
   // String.init(_builtinStringLiteral:utf8CodeUnitCount:isASCII:)
@@ -49,6 +53,10 @@ enum class WellKnownFunction {
 };
 
 static llvm::Optional<WellKnownFunction> classifyFunction(SILFunction *fn) {
+  if (fn->hasSemanticsAttr("array.init_empty"))
+    return WellKnownFunction::ArrayInitEmpty;
+  if (fn->hasSemanticsAttr("array.allocate_uninitialized"))
+    return WellKnownFunction::AllocateUninitializedArray;
   if (fn->hasSemanticsAttr("string.init_empty"))
     return WellKnownFunction::StringInitEmpty;
   // There are two string initializers in the standard library with the
@@ -336,6 +344,27 @@ SymbolicValue ConstExprFunctionState::computeConstantValue(SILValue value) {
   if (auto *bai = dyn_cast<BeginAccessInst>(value))
     return getConstantValue(bai->getOperand());
 
+  // Builtin.RawPointer and addresses have the same representation.
+  if (auto *p2ai = dyn_cast<PointerToAddressInst>(value))
+    return getConstantValue(p2ai->getOperand());
+
+  // Indexing a pointer moves its deepest index.
+  if (auto *ia = dyn_cast<IndexAddrInst>(value)) {
+    auto index = getConstantValue(ia->getOperand(1));
+    if (!index.isConstant())
+      return index;
+    auto basePtr = getConstantValue(ia->getOperand(0));
+    if (basePtr.getKind() != SymbolicValue::Address)
+      return basePtr;
+
+    SmallVector<unsigned, 4> accessPath;
+    auto *memObject = basePtr.getAddressValue(accessPath);
+    assert(!accessPath.empty() && "Can't index a non-indexed address");
+    accessPath.back() += index.getIntegerValue().getLimitedValue();
+    return SymbolicValue::getAddress(memObject, accessPath,
+                                     evaluator.getASTContext());
+  }
+
   LLVM_DEBUG(llvm::dbgs() << "ConstExpr Unknown simple: " << *value << "\n");
 
   // Otherwise, we don't know how to handle this.
@@ -588,6 +617,15 @@ ConstExprFunctionState::computeOpaqueCallResult(ApplyInst *apply,
   return evaluator.getUnknown((SILInstruction *)apply, UnknownReason::Default);
 }
 
+/// If the specified type is a Swift.Array of some element type, then return the
+/// element type.  Otherwise, return a null Type.
+static Type getArrayElementType(Type ty) {
+  if (auto bgst = ty->getAs<BoundGenericStructType>())
+    if (bgst->getDecl() == bgst->getASTContext().getArrayDecl())
+      return bgst->getGenericArgs()[0];
+  return Type();
+}
+
 /// Given a call to a well known function, collect its arguments as constants,
 /// fold it, and return None.  If any of the arguments are not constants, marks
 /// the call's results as Unknown, and return an Unknown with information about
@@ -597,6 +635,74 @@ ConstExprFunctionState::computeWellKnownCallResult(ApplyInst *apply,
                                                    WellKnownFunction callee) {
   auto conventions = apply->getSubstCalleeConv();
   switch (callee) {
+  case WellKnownFunction::ArrayInitEmpty: { // Array.init()
+    assert(conventions.getNumDirectSILResults() == 1 &&
+           conventions.getNumIndirectSILResults() == 0 &&
+           "unexpected Array.init() signature");
+
+    auto literal = getConstantValue(apply->getOperand(1));
+    if (literal.getKind() != SymbolicValue::Metatype)
+      break;
+
+    auto literalType = literal.getMetatypeValue();
+
+    auto arrayVal = SymbolicValue::getArray(
+        {}, getArrayElementType(literalType)->getCanonicalType(),
+        evaluator.getASTContext());
+    setValue(apply, arrayVal);
+    return None;
+  }
+  case WellKnownFunction::AllocateUninitializedArray: {
+    // This function has this signature:
+    //   func _allocateUninitializedArray<Element>(_ builtinCount: Builtin.Word)
+    //     -> (Array<Element>, Builtin.RawPointer)
+
+    // Figure out the allocation size.
+    auto numElementsSV = getConstantValue(apply->getOperand(1));
+    if (!numElementsSV.isConstant())
+      return numElementsSV;
+
+    unsigned numElements = numElementsSV.getIntegerValue().getLimitedValue();
+
+    // We only support allocating uninitialized arrays in flow-sensitive code
+    // for now.
+    // TODO: Support allocating uninitialized arrays in top-level code too. This
+    // will allow const-evaluated array literals in top-level code.
+    if (!fn)
+      return evaluator.getUnknown((SILInstruction *)apply, UnknownReason::Default);
+
+    SmallVector<SymbolicValue, 8> elementConstants;
+
+    // In the flow sensitive case, we can analyze this as an allocation of
+    // uninitialized array memory, and allow the stores to the pointer result
+    // to initialize the elements in a normal flow sensitive way.
+    elementConstants.assign(numElements, SymbolicValue::getUninitMemory());
+
+    auto arrayType = apply->getType().castTo<TupleType>()->getElementType(0);
+    auto arrayEltType = getArrayElementType(arrayType);
+    assert(arrayEltType && "Couldn't understand Swift.Array type?");
+
+    // Build this value as an array of elements.  Wrap it up into a memory
+    // object with an address refering to it.
+    auto arrayVal = SymbolicValue::getArray(elementConstants,
+                                            arrayEltType->getCanonicalType(),
+                                            evaluator.getASTContext());
+
+    auto *memObject = SymbolicValueMemoryObject::create(
+        arrayType, arrayVal, evaluator.getASTContext());
+
+    // Okay, now we have the array memory object, return the indirect array
+    // value and the pointer object we need for the tuple result.
+    auto indirectArr = SymbolicValue::getArrayAddress(memObject);
+
+    // The address notationally points to the first element of the array.
+    auto address =
+        SymbolicValue::getAddress(memObject, {0}, evaluator.getASTContext());
+
+    setValue(apply, SymbolicValue::getAggregate({indirectArr, address},
+                                                 evaluator.getASTContext()));
+    return None;
+  }
   case WellKnownFunction::StringInitEmpty: { // String.init()
     assert(conventions.getNumDirectSILResults() == 1 &&
            conventions.getNumIndirectSILResults() == 0 &&
